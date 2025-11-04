@@ -1,0 +1,73 @@
+
+
+
+
+信号质量衰减的连续惩罚R_penalty:激励无人机主动规避进入拒止环境，或在必须进入时尽可能缩短滞留时间。
+def sat_function(x: float) -> float:
+    if x < 0:
+        return 0.0
+    elif 0 <= x <= 1:
+        return x
+    else:
+        return 1.0
+
+# 信号质量衰减的连续惩罚公式（文档3.3.6节定义）
+def signal_attenuation_penalty(
+    drone_pos: tuple,          # 无人机i当前位置(x, y)
+    denied_area: Polygon,      # 拒止区域几何边界
+    r_trans: float,            # 信号衰减过渡区半径（超参数）
+    k_att: float               # 惩罚权重系数（可调参数）
+) -> float:
+    # 计算无人机到拒止区域边界的欧几里得距离d_i
+    drone_point = Point(drone_pos)
+    if denied_area.contains(drone_point):
+        nearest_bound = nearest_points(drone_point, denied_area.boundary)[1]
+        d_i = drone_point.distance(nearest_bound)
+    else:
+        d_i = drone_point.distance(denied_area.boundary)
+
+    # 计算信号质量因子q_i^t
+    q_i_t = 1.0 if not denied_area.contains(drone_point) else sat_function(d_i / r_trans)
+
+    # 计算连续惩罚项 R_att^t(i) = -k_att·(1 - q_i^t)
+    return -k_att * (1 - q_i_t)
+
+
+
+路径持久性与相似性奖励R_persistence:该奖励项专门针对进入拒止区域后失去目标和通信的无人机。它无需全局信息，通过局部感知激励无人机根据路径持久性 和路径相似性 识别那些运动轨迹最稳定、最可靠的友机作为跟随机，从而实现自组织的协同跟随。
+# 2. 路径持久性与相似性奖励公式实现
+def path_persistence_similarity_reward(drone_i_hist, neighbor_histories, L, k):
+    # 预处理历史位置：截取最近L步
+    def preprocess_hist(hist):
+        return np.array(hist[-L:]) if len(hist) >= L else np.array(hist)
+
+    H_i = preprocess_hist(drone_i_hist)
+    if len(H_i) < 2:
+        return 0.0
+
+    s_list = []
+    for neighbor_hist in neighbor_histories:
+        H_j = preprocess_hist(neighbor_hist)
+        if len(H_j) < 2:
+            s_list.append(0.0)
+            continue
+        # 计算运动向量
+        v_i = np.diff(H_i, axis=0)
+        v_j = np.diff(H_j, axis=0)
+        min_len = min(len(v_i), len(v_j))
+        v_i, v_j = v_i[:min_len], v_j[:min_len]
+        # 路径相似性（余弦相似度均值）
+        cos_sim = [np.dot(vi, vj)/(np.linalg.norm(vi)*np.linalg.norm(vj)+1e-8) for vi, vj in zip(v_i, v_j)]
+        avg_cos_sim = np.mean(cos_sim)
+        # 路径持久性（运动向量方差倒数）
+        var_vj = np.var(v_j, axis=0).sum()
+        persistence = 1/(1 + var_vj)
+        # 计算评分s_ij
+        s_list.append(avg_cos_sim * persistence)
+
+    # Softmax加权
+    s_array = np.array(s_list)
+    exp_s = np.exp(s_array - np.max(s_array))
+    weights = exp_s / exp_s.sum()
+    # 总奖励
+    return k * np.sum(weights * s_array)
